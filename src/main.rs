@@ -70,10 +70,7 @@ async fn stream_song(mut socket: tokio::net::TcpStream, request: Request) -> std
             return Ok(());
         }
     };
-    let path = format!(
-        "/Users/crisandolindesmanrumahorbo/Documents/personal/rust/spotify_streaming/mp3/{}.mp3",
-        song
-    );
+    let path = format!("./mp3/{}.mp3", song);
     let file = match File::open(path).await {
         Ok(file) => file,
         Err(e) => {
