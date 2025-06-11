@@ -1,13 +1,26 @@
 use anyhow::anyhow;
 use anyhow::{Context, Result};
-use request_http_parser::parser::{Method::GET, Request};
-use std::time::Duration;
-use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use request_http_parser::parser::{Method::GET, Method::HEAD, Method::OPTIONS, Request};
+use std::io::SeekFrom;
+use tokio::fs::{self, File};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 pub const BAD_REQUEST: &str = "HTTP/1.1 400 Bad Request\r\n\r\n";
 pub const NOT_FOUND: &str = "HTTP/1.1 404 NOT FOUND\r\n\r\n";
+pub const OPTIONS_CORS: &str = "HTTP/1.1 204 No Content\r\n\
+            Access-Control-Allow-Origin: *\r\n\
+            Access-Control-Allow-Methods: POST, GET, OPTIONS, HEAD\r\n\
+            Access-Control-Allow-Headers: Content-Type\r\n\
+            Access-Control-Max-Age: 86400\r\n\
+            \r\n";
+pub const OK_RESPONSE: &str = "HTTP/1.1 200 OK\r\n\
+            Access-Control-Allow-Origin: *\r\n\
+            Access-Control-Allow-Methods: POST, GET, OPTIONS, HEAD\r\n\
+            Access-Control-Allow-Headers: Content-Type\r\n\
+            Access-Control-Max-Age: 86400\r\n\
+            Content-Type: application/json\r\n\
+            \r\n";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -35,6 +48,14 @@ async fn main() -> Result<()> {
                     }
                 };
                 match (&request.method, request.path.as_str()) {
+                    (OPTIONS, _) => {
+                        let _ = socket
+                            .write_all(format!("{}{}", OPTIONS_CORS, "").as_bytes())
+                            .await;
+                    }
+                    (HEAD, "/stream") => {
+                        get_info(socket, request).await.expect("error head stream")
+                    }
                     (GET, "/stream") => stream_song(socket, request).await.expect("error handle"),
                     _ => {
                         let _ = socket
@@ -52,7 +73,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn stream_song(mut socket: tokio::net::TcpStream, request: Request) -> std::io::Result<()> {
+async fn get_info(mut socket: tokio::net::TcpStream, request: Request) -> std::io::Result<()> {
     let song = match &request.params {
         Some(params) => match params.get("song") {
             Some(song) => song,
@@ -83,39 +104,123 @@ async fn stream_song(mut socket: tokio::net::TcpStream, request: Request) -> std
     };
     let metadata = file.metadata().await?;
     let total_size = metadata.len();
-
-    let mut reader = BufReader::new(file);
     let headers = format!(
-        concat!(
-            "HTTP/1.1 200 OK\r\n",
-            "Content-Type: audio/mpeg\r\n",
-            "Transfer-Encoding: chunked\r\n",
-            "Access-Control-Allow-Origin: *\r\n",
-            "Access-Control-Expose-Headers: X-Content-Length\r\n",
-            "X-Content-Length: {}\r\n",
-            "\r\n"
-        ),
+        "HTTP/1.1 200 OK\r\n\
+         Content-Length: {}\r\n\
+         Accept-Ranges: bytes\r\n\
+         Content-Type: audio/mpeg\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         \r\n",
         total_size
     );
-    socket.write_all(headers.as_bytes()).await?;
-
-    let mut buffer = [0u8; 32 * 1024];
-    loop {
-        let n = reader.read(&mut buffer).await?;
-        if n == 0 {
-            break;
-        }
-
-        let chunk = &buffer[..n];
-        let size_line = format!("{:X}\r\n", chunk.len());
-        socket.write_all(size_line.as_bytes()).await?;
-        socket.write_all(chunk).await?;
-        socket.write_all(b"\r\n").await?;
-
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-
-    socket.write_all(b"0\r\n\r\n").await?;
+    socket
+        .write_all(headers.as_bytes())
+        .await
+        .expect("error write head");
     Ok(())
 }
 
+async fn stream_song(mut socket: tokio::net::TcpStream, request: Request) -> std::io::Result<()> {
+    let song = match &request.params {
+        Some(params) => match params.get("song") {
+            Some(song) => song,
+            None => {
+                println!("no song params");
+                let _ = socket
+                    .write_all(format!("{}{}", NOT_FOUND, "404 Not Found").as_bytes())
+                    .await;
+                return Ok(());
+            }
+        },
+        None => {
+            println!("no params");
+
+            let _ = socket
+                .write_all(format!("{}{}", NOT_FOUND, "404 Not Found").as_bytes())
+                .await;
+            return Ok(());
+        }
+    };
+    let path = format!("./mp3/{}.mp3", song);
+    let metadata = fs::metadata(&path).await?;
+    let file_size = metadata.len();
+
+    let range = match request.headers.get("range") {
+        Some(range) => range,
+        None => {
+            println!("no range header");
+
+            let _ = socket
+                .write_all(format!("{}{}", BAD_REQUEST, "").as_bytes())
+                .await;
+
+            return Ok(());
+        }
+    };
+    let (start, end) = match range.split("=").nth(1) {
+        Some(parts) => {
+            let parts: Vec<&str> = parts.trim().split('-').collect();
+            let start = match parts[0].parse::<u64>() {
+                Ok(start) => start,
+                Err(_) => {
+                    println!("start");
+
+                    let _ = socket
+                        .write_all(format!("{}{}", BAD_REQUEST, "").as_bytes())
+                        .await;
+
+                    return Ok(());
+                }
+            };
+            let end = match parts[1].parse::<u64>() {
+                Ok(end) => end,
+                Err(_) => {
+                    let default_chunk_size: u64 = 64 * 1024;
+                    let max_end = start + default_chunk_size - 1;
+                    std::cmp::min(max_end, file_size - 1)
+                }
+            };
+            (start, end)
+        }
+        None => {
+            println!("value range ");
+
+            let _ = socket
+                .write_all(format!("{}{}", BAD_REQUEST, "").as_bytes())
+                .await;
+            return Ok(());
+        }
+    };
+    let content_length = end - start + 1;
+    let mut file = match File::open(path).await {
+        Ok(file) => file,
+        Err(e) => {
+            println!("{}", e);
+            let _ = socket
+                .write_all(format!("{}{}", NOT_FOUND, "404 Not Found").as_bytes())
+                .await;
+            return Ok(());
+        }
+    };
+    file.seek(SeekFrom::Start(start)).await?;
+    let metadata = file.metadata().await?;
+    let file_size = metadata.len();
+
+    let mut buf = vec![0; content_length as usize];
+    file.read_exact(&mut buf).await?;
+
+    let header = format!(
+        "HTTP/1.1 206 Partial Content\r\n\
+        Content-Type: audio/mpeg\r\n\
+        Content-Length: {}\r\n\
+        Accept-Ranges: bytes\r\n\
+        Access-Control-Allow-Origin: *\r\n\
+        Content-Range: bytes {}-{}/{}\r\n\
+        \r\n",
+        content_length, start, end, file_size
+    );
+    socket.write_all(header.as_bytes()).await?;
+    socket.write_all(&buf).await?;
+
+    Ok(())
+}

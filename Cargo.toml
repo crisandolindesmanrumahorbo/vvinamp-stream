@@ -5,5 +5,5 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1.45.1", features = ["full"] }
-request-http-parser = "0.1.1"
+request-http-parser = "0.1.2"
 anyhow = { version = "1.0", default-features = false }
