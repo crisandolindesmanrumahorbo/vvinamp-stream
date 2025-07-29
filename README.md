@@ -1,0 +1,4 @@
+## Installation
+
+- ytdlp
+- ffmpeg
