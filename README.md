@@ -18,6 +18,4 @@ brew install ffmpeg
 cargo run
 ```
 
-![Product Highlight](image.png)
-
-![Flow](image-1.png)
+![Product Highlight](vvinamp.jpg)
